@@ -19,6 +19,7 @@
 """Handles all requests relating to compute resources (e.g. guest VMs,
 networking and storage of VMs, and compute hosts on which they run)."""
 
+import base64
 import collections
 import copy
 import functools
@@ -48,7 +49,6 @@ from nova.compute import power_state
 from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
-from nova.compute.utils import wrap_instance_event
 from nova.compute import vm_states
 from nova import conductor
 import nova.conf
@@ -772,7 +772,14 @@ class API(base.Base):
         if user_data:
             try:
                 base64utils.decode_as_bytes(user_data)
-            except TypeError:
+            except (base64.binascii.Error, TypeError):
+                # TODO(harlowja): reduce the above exceptions caught to
+                # only type error once we get a new oslo.serialization
+                # release that captures and makes only one be output.
+                #
+                # We can eliminate the capture of `binascii.Error` when:
+                #
+                # https://review.openstack.org/#/c/418066/ is released.
                 raise exception.InstanceUserDataMalformed()
 
         # When using Neutron, _check_requested_secgroups will translate and
@@ -1862,12 +1869,14 @@ class API(base.Base):
                                  == vm_states.SHELVED_OFFLOADED)
             if not instance.host and not shelved_offloaded:
                 try:
-                    with compute_utils.notify_about_instance_delete(
+                    compute_utils.notify_about_instance_usage(
                             self.notifier, context, instance,
-                            delete_type
-                            if delete_type != 'soft_delete'
-                            else 'delete'):
-                        instance.destroy()
+                            "%s.start" % delete_type)
+                    instance.destroy()
+                    compute_utils.notify_about_instance_usage(
+                            self.notifier, context, instance,
+                            "%s.end" % delete_type,
+                            system_metadata=instance.system_metadata)
                     LOG.info('Instance deleted and does not have host '
                              'field, its vm_state is %(state)s.',
                              {'state': instance.vm_state},
@@ -2024,37 +2033,38 @@ class API(base.Base):
         else:
             LOG.warning("instance's host %s is down, deleting from "
                         "database", instance.host, instance=instance)
-        with compute_utils.notify_about_instance_delete(
-                self.notifier, context, instance,
-                delete_type if delete_type != 'soft_delete' else 'delete'):
+        compute_utils.notify_about_instance_usage(
+            self.notifier, context, instance, "%s.start" % delete_type)
 
-            elevated = context.elevated()
-            if self.cell_type != 'api':
-                # NOTE(liusheng): In nova-network multi_host scenario,deleting
-                # network info of the instance may need instance['host'] as
-                # destination host of RPC call. If instance in
-                # SHELVED_OFFLOADED state, instance['host'] is None, here, use
-                # shelved_host as host to deallocate network info and reset
-                # instance['host'] after that. Here we shouldn't use
-                # instance.save(), because this will mislead user who may think
-                # the instance's host has been changed, and actually, the
-                # instance.host is always None.
-                orig_host = instance.host
-                try:
-                    if instance.vm_state == vm_states.SHELVED_OFFLOADED:
-                        sysmeta = getattr(instance,
-                                          obj_base.get_attrname(
-                                              'system_metadata'))
-                        instance.host = sysmeta.get('shelved_host')
-                    self.network_api.deallocate_for_instance(elevated,
-                                                             instance)
-                finally:
-                    instance.host = orig_host
+        elevated = context.elevated()
+        if self.cell_type != 'api':
+            # NOTE(liusheng): In nova-network multi_host scenario,deleting
+            # network info of the instance may need instance['host'] as
+            # destination host of RPC call. If instance in SHELVED_OFFLOADED
+            # state, instance['host'] is None, here, use shelved_host as host
+            # to deallocate network info and reset instance['host'] after that.
+            # Here we shouldn't use instance.save(), because this will mislead
+            # user who may think the instance's host has been changed, and
+            # actually, the instance.host is always None.
+            orig_host = instance.host
+            try:
+                if instance.vm_state == vm_states.SHELVED_OFFLOADED:
+                    sysmeta = getattr(instance,
+                                      obj_base.get_attrname('system_metadata'))
+                    instance.host = sysmeta.get('shelved_host')
+                self.network_api.deallocate_for_instance(elevated,
+                                                         instance)
+            finally:
+                instance.host = orig_host
 
-            # cleanup volumes
-            self._local_cleanup_bdm_volumes(bdms, instance, context)
-            cb(context, instance, bdms, local=True)
-            instance.destroy()
+        # cleanup volumes
+        self._local_cleanup_bdm_volumes(bdms, instance, context)
+        cb(context, instance, bdms, local=True)
+        sys_meta = instance.system_metadata
+        instance.destroy()
+        compute_utils.notify_about_instance_usage(
+            self.notifier, context, instance, "%s.end" % delete_type,
+            system_metadata=sys_meta)
 
     def _do_delete(self, context, instance, bdms, local=False):
         if local:
@@ -2308,13 +2318,21 @@ class API(base.Base):
             # any character, we need to use regexp escaping for it.
             filters['ip'] = '^%s$' % fixed_ip.replace('.', '\\.')
 
+        def _remap_metadata_filter(metadata):
+            filters['metadata'] = jsonutils.loads(metadata)
+
+        def _remap_system_metadata_filter(metadata):
+            filters['system_metadata'] = jsonutils.loads(metadata)
+
         # search_option to filter_name mapping.
         filter_mapping = {
                 'image': 'image_ref',
                 'name': 'display_name',
                 'tenant_id': 'project_id',
                 'flavor': _remap_flavor_filter,
-                'fixed_ip': _remap_fixed_ip_filter}
+                'fixed_ip': _remap_fixed_ip_filter,
+                'metadata': _remap_metadata_filter,
+                'system_metadata': _remap_system_metadata_filter}
 
         # copy from search_opts, doing various remappings as necessary
         for opt, value in search_opts.items():
@@ -2582,10 +2600,13 @@ class API(base.Base):
         props_copy = dict(extra_properties, backup_type=backup_type)
 
         if compute_utils.is_volume_backed_instance(context, instance):
-            LOG.info("It's not supported to backup volume backed "
-                     "instance.", instance=instance)
-            raise exception.InvalidRequest(
-                _('Backup is not supported for volume-backed instances.'))
+            LOG.info(_LI("It's now supported to backup volume backed "
+                         "instance."), context=context, instance=instance)
+            props_copy['image_type'] = 'backup'
+            props_copy['instance_uuid'] = instance.uuid
+            image_meta = self.snapshot_volume_backed(context, instance, name,
+                                                     extra_properties=props_copy)
+
         else:
             image_meta = self._create_image(context, instance,
                                             name, 'backup',
@@ -2845,29 +2866,11 @@ class API(base.Base):
     def rebuild(self, context, instance, image_href, admin_password,
                 files_to_inject=None, **kwargs):
         """Rebuild the given instance with the provided attributes."""
+        orig_image_ref = instance.image_ref or ''
         files_to_inject = files_to_inject or []
         metadata = kwargs.get('metadata', {})
         preserve_ephemeral = kwargs.get('preserve_ephemeral', False)
         auto_disk_config = kwargs.get('auto_disk_config')
-
-        if 'key_name' in kwargs:
-            key_name = kwargs.pop('key_name')
-            if key_name:
-                # NOTE(liuyulong): we are intentionally using the user_id from
-                # the request context rather than the instance.user_id because
-                # users own keys but instances are owned by projects, and
-                # another user in the same project can rebuild an instance
-                # even if they didn't create it.
-                key_pair = objects.KeyPair.get_by_name(context,
-                                                       context.user_id,
-                                                       key_name)
-                instance.key_name = key_pair.name
-                instance.key_data = key_pair.public_key
-                instance.keypairs = objects.KeyPairList(objects=[key_pair])
-            else:
-                instance.key_name = None
-                instance.key_data = None
-                instance.keypairs = objects.KeyPairList(objects=[])
 
         image_id, image = self._get_image(context, image_href)
         self._check_auto_disk_config(image=image, **kwargs)
@@ -2876,41 +2879,6 @@ class API(base.Base):
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
             context, instance.uuid)
         root_bdm = compute_utils.get_root_bdm(context, instance, bdms)
-
-        # Check to see if the image is changing and we have a volume-backed
-        # server. The compute doesn't support changing the image in the
-        # root disk of a volume-backed server, so we need to just fail fast.
-        is_volume_backed = compute_utils.is_volume_backed_instance(
-            context, instance, bdms)
-        if is_volume_backed:
-            # For boot from volume, instance.image_ref is empty, so we need to
-            # query the image from the volume.
-            if root_bdm is None:
-                # This shouldn't happen and is an error, we need to fail. This
-                # is not the users fault, it's an internal error. Without a
-                # root BDM we have no way of knowing the backing volume (or
-                # image in that volume) for this instance.
-                raise exception.NovaException(
-                    _('Unable to find root block device mapping for '
-                      'volume-backed instance.'))
-
-            volume = self.volume_api.get(context, root_bdm.volume_id)
-            volume_image_metadata = volume.get('volume_image_metadata', {})
-            orig_image_ref = volume_image_metadata.get('image_id')
-
-            if orig_image_ref != image_href:
-                # Leave a breadcrumb.
-                LOG.debug('Requested to rebuild instance with a new image %s '
-                          'for a volume-backed server with image %s in its '
-                          'root volume which is not supported.', image_href,
-                          orig_image_ref, instance=instance)
-                msg = _('Unable to rebuild with a different image for a '
-                        'volume-backed server.')
-                raise exception.ImageUnacceptable(
-                    image_id=image_href, reason=msg)
-        else:
-            orig_image_ref = instance.image_ref
-
         self._checks_for_create_and_rebuild(context, image_id, image,
                 flavor, metadata, files_to_inject, root_bdm)
 
@@ -2950,10 +2918,7 @@ class API(base.Base):
         instance.update(options_from_image)
 
         instance.task_state = task_states.REBUILDING
-        # An empty instance.image_ref is currently used as an indication
-        # of BFV.  Preserve that over a rebuild to not break users.
-        if not is_volume_backed:
-            instance.image_ref = image_href
+        instance.image_ref = image_href
         instance.kernel_id = kernel_id or ""
         instance.ramdisk_id = ramdisk_id or ""
         instance.progress = 0
@@ -2971,35 +2936,9 @@ class API(base.Base):
         # sure that all our instances are currently migrated to have an
         # attached RequestSpec object but let's consider that the operator only
         # half migrated all their instances in the meantime.
-        host = instance.host
         try:
             request_spec = objects.RequestSpec.get_by_instance_uuid(
                 context, instance.uuid)
-            # If a new image is provided on rebuild, we will need to run
-            # through the scheduler again, but we want the instance to be
-            # rebuilt on the same host it's already on.
-            if orig_image_ref != image_href:
-                # We have to modify the request spec that goes to the scheduler
-                # to contain the new image. We persist this since we've already
-                # changed the instance.image_ref above so we're being
-                # consistent.
-                request_spec.image = objects.ImageMeta.from_dict(image)
-                request_spec.save()
-                if 'scheduler_hints' not in request_spec:
-                    request_spec.scheduler_hints = {}
-                # Nuke the id on this so we can't accidentally save
-                # this hint hack later
-                del request_spec.id
-
-                # NOTE(danms): Passing host=None tells conductor to
-                # call the scheduler. The _nova_check_type hint
-                # requires that the scheduler returns only the same
-                # host that we are currently on and only checks
-                # rebuild-related filters.
-                request_spec.scheduler_hints['_nova_check_type'] = ['rebuild']
-                request_spec.force_hosts = [instance.host]
-                request_spec.force_nodes = [instance.node]
-                host = None
         except exception.RequestSpecNotFound:
             # Some old instances can still have no RequestSpec object attached
             # to them, we need to support the old way
@@ -3009,7 +2948,7 @@ class API(base.Base):
                 new_pass=admin_password, injected_files=files_to_inject,
                 image_ref=image_href, orig_image_ref=orig_image_ref,
                 orig_sys_metadata=orig_sys_metadata, bdms=bdms,
-                preserve_ephemeral=preserve_ephemeral, host=host,
+                preserve_ephemeral=preserve_ephemeral, host=instance.host,
                 request_spec=request_spec,
                 kwargs=kwargs)
 
@@ -3127,25 +3066,13 @@ class API(base.Base):
     @check_instance_cell
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED])
     def resize(self, context, instance, flavor_id=None, clean_shutdown=True,
-               host_name=None, **extra_instance_updates):
+               **extra_instance_updates):
         """Resize (ie, migrate) a running instance.
 
         If flavor_id is None, the process is considered a migration, keeping
         the original flavor_id. If flavor_id is not None, the instance should
         be migrated to a new host and resized to the new flavor_id.
-        host_name is always None in the resize case.
-        host_name can be set in the cold migration case only.
         """
-        if host_name is not None:
-            # Check whether host exists or not.
-            node = objects.ComputeNode.get_first_node_by_host_for_old_compat(
-                context, host_name, use_slave=True)
-
-            # Cannot migrate to the host where the instance exists
-            # because it is useless.
-            if host_name == instance.host:
-                raise exception.CannotMigrateToSameHost()
-
         self._check_auto_disk_config(instance, **extra_instance_updates)
 
         current_instance_type = instance.get_flavor()
@@ -3227,10 +3154,6 @@ class API(base.Base):
         except exception.RequestSpecNotFound:
             # Some old instances can still have no RequestSpec object attached
             # to them, we need to support the old way
-            if host_name is not None:
-                # If there is no request spec we cannot honor the request
-                # and we need to fail.
-                raise exception.CannotMigrateWithTargetHost()
             request_spec = None
 
         # TODO(melwitt): We're not rechecking for strict quota here to guard
@@ -3238,22 +3161,6 @@ class API(base.Base):
         # resource consumption for this operation is written to the database
         # by compute.
         scheduler_hint = {'filter_properties': filter_properties}
-
-        if request_spec:
-            if host_name is None:
-                # If 'host_name' is not specified,
-                # clear the 'requested_destination' field of the RequestSpec.
-                request_spec.requested_destination = None
-            else:
-                # Set the host and the node so that the scheduler will
-                # validate them.
-                # TODO(takashin): It will be added to check whether
-                # the specified host is within the same cell as
-                # the instance or not. If not, raise specific error message
-                # that is clear to the caller.
-                request_spec.requested_destination = objects.Destination(
-                    host=node.host, node=node.hypervisor_hostname)
-
         self.compute_task_api.resize_instance(context, instance,
                 extra_instance_updates, scheduler_hint=scheduler_hint,
                 flavor=new_instance_type,
@@ -3553,17 +3460,10 @@ class API(base.Base):
             return
 
         context = context.elevated()
-        self._record_action_start(context, instance,
-                                  instance_actions.LOCK)
-
-        @wrap_instance_event(prefix='api')
-        def lock(self, context, instance):
-            LOG.debug('Locking', instance=instance)
-            instance.locked = True
-            instance.locked_by = 'owner' if is_owner else 'admin'
-            instance.save()
-
-        lock(self, context, instance)
+        LOG.debug('Locking', instance=instance)
+        instance.locked = True
+        instance.locked_by = 'owner' if is_owner else 'admin'
+        instance.save()
 
     def is_expected_locked_by(self, context, instance):
         is_owner = instance.project_id == context.project_id
@@ -3576,17 +3476,10 @@ class API(base.Base):
     def unlock(self, context, instance):
         """Unlock the given instance."""
         context = context.elevated()
-        self._record_action_start(context, instance,
-                                  instance_actions.UNLOCK)
-
-        @wrap_instance_event(prefix='api')
-        def unlock(self, context, instance):
-            LOG.debug('Unlocking', instance=instance)
-            instance.locked = False
-            instance.locked_by = None
-            instance.save()
-
-        unlock(self, context, instance)
+        LOG.debug('Unlocking', instance=instance)
+        instance.locked = False
+        instance.locked_by = None
+        instance.save()
 
     @check_instance_lock
     @check_instance_cell
@@ -3633,26 +3526,6 @@ class API(base.Base):
                 device_type=device_type, tag=tag)
         return volume_bdm
 
-    def _check_volume_already_attached_to_instance(self, context, instance,
-                                                   volume_id):
-        """Avoid attaching the same volume to the same instance twice.
-
-           As the new Cinder flow (microversion 3.44) is handling the checks
-           differently and allows to attach the same volume to the same
-           instance twice to enable live_migrate we are checking whether the
-           BDM already exists for this combination for the new flow and fail
-           if it does.
-        """
-
-        try:
-            objects.BlockDeviceMapping.get_by_volume_and_instance(
-                context, volume_id, instance.uuid)
-
-            msg = _("volume %s already attached") % volume_id
-            raise exception.InvalidVolume(reason=msg)
-        except exception.VolumeBDMNotFound:
-            pass
-
     def _check_attach_and_reserve_volume(self, context, volume_id, instance):
         volume = self.volume_api.get(context, volume_id)
         self.volume_api.check_availability_zone(context, volume,
@@ -3673,8 +3546,6 @@ class API(base.Base):
             device_type=device_type, tag=tag)
         try:
             self._check_attach_and_reserve_volume(context, volume_id, instance)
-            self._record_action_start(
-                context, instance, instance_actions.ATTACH_VOLUME)
             self.compute_rpcapi.attach_volume(context, instance, volume_bdm)
         except Exception:
             with excutils.save_and_reraise_exception():
@@ -3694,22 +3565,16 @@ class API(base.Base):
         therefore the actual attachment will be performed once the
         instance will be unshelved.
         """
-        @wrap_instance_event(prefix='api')
-        def attach_volume(self, context, v_id, instance, dev):
-            self.volume_api.attach(context,
-                                   v_id,
-                                   instance.uuid,
-                                   dev)
 
         volume_bdm = self._create_volume_bdm(
             context, instance, device, volume_id, disk_bus=disk_bus,
             device_type=device_type, is_local_creation=True)
         try:
             self._check_attach_and_reserve_volume(context, volume_id, instance)
-            self._record_action_start(
-                context, instance,
-                instance_actions.ATTACH_VOLUME)
-            attach_volume(self, context, volume_id, instance, device)
+            self.volume_api.attach(context,
+                                   volume_id,
+                                   instance.uuid,
+                                   device)
         except Exception:
             with excutils.save_and_reraise_exception():
                 volume_bdm.destroy()
@@ -3764,8 +3629,6 @@ class API(base.Base):
         attachment_id = None
         if attachments and instance.uuid in attachments:
             attachment_id = attachments[instance.uuid]['attachment_id']
-        self._record_action_start(
-            context, instance, instance_actions.DETACH_VOLUME)
         self.compute_rpcapi.detach_volume(context, instance=instance,
                 volume_id=volume['id'], attachment_id=attachment_id)
 
@@ -3778,20 +3641,13 @@ class API(base.Base):
         If the volume has delete_on_termination option set then we call the
         volume api delete as well.
         """
-        @wrap_instance_event(prefix='api')
-        def detach_volume(self, context, instance, bdms):
-            self._local_cleanup_bdm_volumes(bdms, instance, context)
-
         try:
             self.volume_api.begin_detaching(context, volume['id'])
         except exception.InvalidInput as exc:
             raise exception.InvalidVolume(reason=exc.format_message())
         bdms = [objects.BlockDeviceMapping.get_by_volume_id(
                 context, volume['id'], instance.uuid)]
-        self._record_action_start(
-            context, instance,
-            instance_actions.DETACH_VOLUME)
-        detach_volume(self, context, instance, bdms)
+        self._local_cleanup_bdm_volumes(bdms, instance, context)
 
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
@@ -3839,20 +3695,10 @@ class API(base.Base):
             # we cast to the compute host.
             self.volume_api.reserve_volume(context, new_volume['id'])
         else:
-            try:
-                self._check_volume_already_attached_to_instance(
-                    context, instance, new_volume['id'])
-            except exception.InvalidVolume:
-                with excutils.save_and_reraise_exception():
-                    self.volume_api.roll_detaching(context, old_volume['id'])
-
             # This is a new-style attachment so for the volume that we are
             # going to swap to, create a new volume attachment.
             new_attachment_id = self.volume_api.attachment_create(
                 context, new_volume['id'], instance.uuid)['id']
-
-        self._record_action_start(
-            context, instance, instance_actions.SWAP_VOLUME)
 
         try:
             self.compute_rpcapi.swap_volume(
@@ -3876,8 +3722,6 @@ class API(base.Base):
     def attach_interface(self, context, instance, network_id, port_id,
                          requested_ip, tag=None):
         """Use hotplug to add an network adapter to an instance."""
-        self._record_action_start(
-            context, instance, instance_actions.ATTACH_INTERFACE)
         return self.compute_rpcapi.attach_interface(context,
             instance=instance, network_id=network_id, port_id=port_id,
             requested_ip=requested_ip, tag=tag)
@@ -3888,8 +3732,6 @@ class API(base.Base):
                           task_state=[None])
     def detach_interface(self, context, instance, port_id):
         """Detach an network adapter from an instance."""
-        self._record_action_start(
-            context, instance, instance_actions.DETACH_INTERFACE)
         self.compute_rpcapi.detach_interface(context, instance=instance,
             port_id=port_id)
 
@@ -4977,29 +4819,16 @@ class KeypairAPI(base.Base):
 
         self._notify(context, 'import.start', key_name)
 
+        fingerprint = self._generate_fingerprint(public_key, key_type)
+
         keypair = objects.KeyPair(context)
         keypair.user_id = user_id
         keypair.name = key_name
         keypair.type = key_type
-        keypair.fingerprint = None
-        keypair.public_key = public_key
-
-        compute_utils.notify_about_keypair_action(
-            context=context,
-            keypair=keypair,
-            action=fields_obj.NotificationAction.IMPORT,
-            phase=fields_obj.NotificationPhase.START)
-
-        fingerprint = self._generate_fingerprint(public_key, key_type)
-
         keypair.fingerprint = fingerprint
+        keypair.public_key = public_key
         keypair.create()
 
-        compute_utils.notify_about_keypair_action(
-            context=context,
-            keypair=keypair,
-            action=fields_obj.NotificationAction.IMPORT,
-            phase=fields_obj.NotificationPhase.END)
         self._notify(context, 'import.end', key_name)
 
         return keypair

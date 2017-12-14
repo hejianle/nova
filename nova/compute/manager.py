@@ -1284,7 +1284,7 @@ class ComputeManager(manager.Manager):
         return [_decode(f) for f in injected_files]
 
     def _validate_instance_group_policy(self, context, instance,
-                                        scheduler_hints):
+            filter_properties):
         # NOTE(russellb) Instance group policy is enforced by the scheduler.
         # However, there is a race condition with the enforcement of
         # the policy.  Since more than one instance may be scheduled at the
@@ -1293,15 +1293,11 @@ class ComputeManager(manager.Manager):
         # multiple instances with an affinity policy could end up on different
         # hosts.  This is a validation step to make sure that starting the
         # instance here doesn't violate the policy.
+
+        scheduler_hints = filter_properties.get('scheduler_hints') or {}
         group_hint = scheduler_hints.get('group')
         if not group_hint:
             return
-
-        # The RequestSpec stores scheduler_hints as key=list pairs so we need
-        # to check the type on the value and pull the single entry out. The
-        # API request schema validates that the 'group' hint is a single value.
-        if isinstance(group_hint, list):
-            group_hint = group_hint[0]
 
         @utils.synchronized(group_hint)
         def _do_validation(context, instance, group_hint):
@@ -1474,6 +1470,7 @@ class ComputeManager(manager.Manager):
         instance.vm_state = vm_states.BUILDING
         instance.task_state = task_states.NETWORKING
         instance.save(expected_task_state=[None])
+        self._update_resource_tracker(context, instance)
 
         is_vpn = False
         return network_model.NetworkInfoAsyncWrapper(
@@ -1848,7 +1845,7 @@ class ComputeManager(manager.Manager):
                 self._build_and_run_instance(context, instance, image,
                         decoded_files, admin_password, requested_networks,
                         security_groups, block_device_mapping, node, limits,
-                        filter_properties, request_spec)
+                        filter_properties)
             LOG.info('Took %0.2f seconds to build instance.',
                      timer.elapsed(), instance=instance)
             return build_results.ACTIVE
@@ -1897,9 +1894,6 @@ class ComputeManager(manager.Manager):
             instance.task_state = task_states.SCHEDULING
             instance.save()
 
-            # TODO(mriedem): Pass the request_spec back to conductor so that
-            # it gets to the next chosen host during the reschedule and we
-            # can hopefully eventually get rid of the legacy filter_properties.
             self.compute_task_api.build_instances(context, [instance],
                     image, filter_properties, admin_password,
                     injected_files, requested_networks, security_groups,
@@ -1957,29 +1951,9 @@ class ComputeManager(manager.Manager):
                     return True
         return False
 
-    @staticmethod
-    def _get_scheduler_hints(filter_properties, request_spec=None):
-        """Helper method to get scheduler hints.
-
-        This method prefers to get the hints out of the request spec, but that
-        might not be provided. Conductor will pass request_spec down to the
-        first compute chosen for a build but older computes will not pass
-        the request_spec to conductor's build_instances method for a
-        a reschedule, so if we're on a host via a retry, request_spec may not
-        be provided so we need to fallback to use the filter_properties
-        to get scheduler hints.
-        """
-        hints = {}
-        if request_spec is not None and 'scheduler_hints' in request_spec:
-            hints = request_spec.scheduler_hints
-        if not hints:
-            hints = filter_properties.get('scheduler_hints') or {}
-        return hints
-
     def _build_and_run_instance(self, context, instance, image, injected_files,
             admin_password, requested_networks, security_groups,
-            block_device_mapping, node, limits, filter_properties,
-            request_spec=None):
+            block_device_mapping, node, limits, filter_properties):
 
         image_name = image.get('name')
         self._notify_about_instance_usage(context, instance, 'create.start',
@@ -1997,15 +1971,13 @@ class ComputeManager(manager.Manager):
         self._check_device_tagging(requested_networks, block_device_mapping)
 
         try:
-            scheduler_hints = self._get_scheduler_hints(filter_properties,
-                                                        request_spec)
             rt = self._get_resource_tracker()
             with rt.instance_claim(context, instance, node, limits):
                 # NOTE(russellb) It's important that this validation be done
                 # *after* the resource tracker instance claim, as that is where
                 # the host is set on the instance.
                 self._validate_instance_group_policy(context, instance,
-                                                     scheduler_hints)
+                        filter_properties)
                 image_meta = objects.ImageMeta.from_dict(image)
                 with self._build_resources(context, instance,
                         requested_networks, security_groups, image_meta,
@@ -2662,9 +2634,6 @@ class ComputeManager(manager.Manager):
 
         self._notify_about_instance_usage(context, instance,
                                           "trigger_crash_dump.start")
-        compute_utils.notify_about_instance_action(context, instance,
-                self.host, action=fields.NotificationAction.TRIGGER_CRASH_DUMP,
-                phase=fields.NotificationPhase.START)
 
         # This method does not change task_state and power_state because the
         # effect of a trigger depends on user's configuration.
@@ -2672,9 +2641,6 @@ class ComputeManager(manager.Manager):
 
         self._notify_about_instance_usage(context, instance,
                                           "trigger_crash_dump.end")
-        compute_utils.notify_about_instance_action(context, instance,
-                self.host, action=fields.NotificationAction.TRIGGER_CRASH_DUMP,
-                phase=fields.NotificationPhase.END)
 
     @wrap_exception()
     @reverts_task_state
@@ -2682,25 +2648,25 @@ class ComputeManager(manager.Manager):
     @wrap_instance_fault
     def soft_delete_instance(self, context, instance, reservations):
         """Soft delete an instance on this host."""
-        with compute_utils.notify_about_instance_delete(
-                self.notifier, context, instance, 'soft_delete'):
-            compute_utils.notify_about_instance_action(context, instance,
-                self.host, action=fields.NotificationAction.SOFT_DELETE,
-                phase=fields.NotificationPhase.START)
-            try:
-                self.driver.soft_delete(instance)
-            except NotImplementedError:
-                # Fallback to just powering off the instance if the
-                # hypervisor doesn't implement the soft_delete method
-                self.driver.power_off(instance)
-            instance.power_state = self._get_power_state(context, instance)
-            instance.vm_state = vm_states.SOFT_DELETED
-            instance.task_state = None
-            instance.save(expected_task_state=[task_states.SOFT_DELETING])
-            compute_utils.notify_about_instance_action(
-                context, instance, self.host,
-                action=fields.NotificationAction.SOFT_DELETE,
-                phase=fields.NotificationPhase.END)
+        self._notify_about_instance_usage(context, instance,
+                                          "soft_delete.start")
+        compute_utils.notify_about_instance_action(context, instance,
+            self.host, action=fields.NotificationAction.SOFT_DELETE,
+            phase=fields.NotificationPhase.START)
+        try:
+            self.driver.soft_delete(instance)
+        except NotImplementedError:
+            # Fallback to just powering off the instance if the
+            # hypervisor doesn't implement the soft_delete method
+            self.driver.power_off(instance)
+        instance.power_state = self._get_power_state(context, instance)
+        instance.vm_state = vm_states.SOFT_DELETED
+        instance.task_state = None
+        instance.save(expected_task_state=[task_states.SOFT_DELETING])
+        self._notify_about_instance_usage(context, instance, "soft_delete.end")
+        compute_utils.notify_about_instance_action(context, instance,
+            self.host, action=fields.NotificationAction.SOFT_DELETE,
+            phase=fields.NotificationPhase.END)
 
     @wrap_exception()
     @reverts_task_state
@@ -2975,7 +2941,7 @@ class ComputeManager(manager.Manager):
         # image_ref, not the new one.  Since the DB has been updated
         # to point to the new one... we have to override it.
         # TODO(jaypipes): Move generate_image_url() into the nova.image.api
-        orig_image_ref_url = glance.generate_image_url(orig_image_ref, context)
+        orig_image_ref_url = glance.generate_image_url(orig_image_ref)
         extra_usage_info = {'image_ref_url': orig_image_ref_url}
         compute_utils.notify_usage_exists(
                 self.notifier, context, instance,
@@ -3223,8 +3189,13 @@ class ComputeManager(manager.Manager):
         :param backup_type: daily | weekly
         :param rotation: int representing how many backups to keep around
         """
-        self._do_snapshot_instance(context, image_id, instance)
-        self._rotate_backups(context, instance, backup_type, rotation)
+        is_volume_backed = compute_utils.is_volume_backed_instance(context, instance)
+        if is_volume_backed:
+            instance.task_state = None
+            instance.save(expected_task_state=task_states.IMAGE_BACKUP)
+        else:
+            self._do_snapshot_instance(context, image_id, instance)
+            self._rotate_backups(context, instance, backup_type, rotation)
 
     @wrap_exception()
     @reverts_task_state
@@ -3378,7 +3349,24 @@ class ComputeManager(manager.Manager):
                     LOG.info("Failed to find image %(image_id)s to "
                              "delete", {'image_id': image_id},
                              instance=instance)
-
+                snapshots = image['properties'].get('block_device_mapping', [])
+                for s in snapshots:
+                    snapshot_id = s.get('snapshot_id')
+                    if snapshot_id:
+                        LOG.debug("Deleting snapshot %s", snapshot_id,
+                                  instance=instance)
+                        try:
+                            self.volume_api.delete_snapshot(context,
+                                                            snapshot_id)
+                        except Exception:
+                            # NOTE(flwang): The snapshot deletion may fail due
+                            # to a failure of Cinder. For example, the snapshot
+                            # may have been deleted from Cinder side. For this
+                            # case, we hope the failure won't impact the other
+                            # snapshot delete if there are more than one
+                            # snapshot for the instance.
+                            LOG.debug(_LE('Failed to delete snapshot'),
+                                      instance=instance)
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event(prefix='compute')
@@ -3655,7 +3643,6 @@ class ComputeManager(manager.Manager):
 
             network_info = self.network_api.get_instance_nw_info(context,
                                                                  instance)
-            # TODO(mriedem): Get BDMs here and pass them to the driver.
             self.driver.confirm_migration(context, migration, instance,
                                           network_info)
 
@@ -3851,9 +3838,6 @@ class ComputeManager(manager.Manager):
         with self._error_out_instance_on_exception(context, instance):
             self._notify_about_instance_usage(
                     context, instance, "resize.revert.start")
-            compute_utils.notify_about_instance_action(context, instance,
-                self.host, action=fields.NotificationAction.RESIZE_REVERT,
-                    phase=fields.NotificationPhase.START)
 
             # NOTE(mriedem): delete stashed old_vm_state information; we
             # default to ACTIVE for backwards compatibility if old_vm_state
@@ -3913,9 +3897,6 @@ class ComputeManager(manager.Manager):
 
             self._notify_about_instance_usage(
                     context, instance, "resize.revert.end")
-            compute_utils.notify_about_instance_action(context, instance,
-                self.host, action=fields.NotificationAction.RESIZE_REVERT,
-                    phase=fields.NotificationPhase.END)
 
     def _revert_allocation(self, context, instance, migration):
         """Revert an allocation that is held by migration to our instance."""
@@ -5099,7 +5080,6 @@ class ComputeManager(manager.Manager):
         return do_reserve()
 
     @wrap_exception()
-    @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def attach_volume(self, context, instance, bdm):
         """Attach a volume to an instance."""
@@ -5242,7 +5222,6 @@ class ComputeManager(manager.Manager):
                                 instance=instance)
 
     @wrap_exception()
-    @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def detach_volume(self, context, volume_id, instance, attachment_id=None):
         """Detach a volume from an instance.
@@ -5407,7 +5386,6 @@ class ComputeManager(manager.Manager):
         return (comp_ret, new_cinfo)
 
     @wrap_exception()
-    @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def swap_volume(self, context, old_volume_id, new_volume_id, instance,
                     new_attachment_id=None):
@@ -5507,7 +5485,6 @@ class ComputeManager(manager.Manager):
             pass
 
     @wrap_exception()
-    @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def attach_interface(self, context, instance, network_id, port_id,
                          requested_ip, tag=None):
@@ -5571,7 +5548,6 @@ class ComputeManager(manager.Manager):
         return network_info[0]
 
     @wrap_exception()
-    @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def detach_interface(self, context, instance, port_id):
         """Detach a network adapter from an instance."""
@@ -5719,11 +5695,10 @@ class ComputeManager(manager.Manager):
         :param context: security context
         :param instance: dict of instance data
         :param block_migration: if true, prepare for block migration
-        :param disk: disk info of instance
         :param migrate_data: A dict or LiveMigrateData object holding data
                              required for live migration without shared
                              storage.
-        :returns: migrate_data containing additional migration info
+
         """
         LOG.debug('pre_live_migration data is %s', migrate_data)
         # TODO(tdurakov): remove dict to object conversion once RPC API version
@@ -5786,10 +5761,6 @@ class ComputeManager(manager.Manager):
         self._notify_about_instance_usage(
                      context, instance, "live_migration.pre.start",
                      network_info=network_info)
-        compute_utils.notify_about_instance_action(
-            context, instance, self.host,
-            action=fields.NotificationAction.LIVE_MIGRATION_PRE,
-            phase=fields.NotificationPhase.START)
 
         migrate_data = self.driver.pre_live_migration(context,
                                        instance,
@@ -5822,11 +5793,6 @@ class ComputeManager(manager.Manager):
         self._notify_about_instance_usage(
                      context, instance, "live_migration.pre.end",
                      network_info=network_info)
-        compute_utils.notify_about_instance_action(
-            context, instance, self.host,
-            action=fields.NotificationAction.LIVE_MIGRATION_PRE,
-            phase=fields.NotificationPhase.END)
-
         # TODO(tdurakov): remove dict to object conversion once RPC API version
         # is bumped to 5.x
         if not got_migrate_data_object and migrate_data:
@@ -5965,17 +5931,9 @@ class ComputeManager(manager.Manager):
 
         self._notify_about_instance_usage(
             context, instance, 'live.migration.abort.start')
-        compute_utils.notify_about_instance_action(
-            context, instance, self.host,
-            action=fields.NotificationAction.LIVE_MIGRATION_ABORT,
-            phase=fields.NotificationPhase.START)
         self.driver.live_migration_abort(instance)
         self._notify_about_instance_usage(
             context, instance, 'live.migration.abort.end')
-        compute_utils.notify_about_instance_action(
-            context, instance, self.host,
-            action=fields.NotificationAction.LIVE_MIGRATION_ABORT,
-            phase=fields.NotificationPhase.END)
 
     def _live_migration_cleanup_flags(self, migrate_data):
         """Determine whether disks or instance path need to be cleaned up after
@@ -6333,8 +6291,6 @@ class ComputeManager(manager.Manager):
 
         :param context: security context
         :param instance: a nova.objects.instance.Instance object sent over rpc
-        :param destroy_disks: whether to destroy volumes or not
-        :param migrate_data: contains migration info
         """
         network_info = self.network_api.get_instance_nw_info(context, instance)
         self._notify_about_instance_usage(
